@@ -1,0 +1,462 @@
+- name: Run secret server code on ansible node with local connection localhost
+  connection: local
+  delegate_to: localhost
+  run_once: true
+  when: state == "present"
+  block:
+    - name: Ensure required variables are defined
+      ansible.builtin.assert:
+        that:
+          - delinea_server_url is defined and delinea_server_url | length > 0
+          - delinea_username is defined and delinea_username | length > 0
+          - delinea_password is defined and delinea_password | length > 0
+          - delinea_secret_id is defined
+        fail_msg: >
+          One or more required Delinea variables (delinea_server_url,
+          delinea_username, delinea_password, delinea_secret_id) are not defined.
+        quiet: yes
+
+    - name: Authenticate to Delinea Secret Server and get token
+      ansible.builtin.uri:
+        url: "{{ delinea_server_url }}/oauth2/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: "password"
+          username: "{{ delinea_username }}"
+          password: "{{ delinea_password }}"
+        status_code: 200
+        return_content: yes
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+        validate_certs: yes
+      register: auth_response
+      no_log: "{{ no_log_parameter }}" # Sensitive information, ensure this is set to true in production
+
+    - name: Set access token fact
+      ansible.builtin.set_fact:
+        access_token: "{{ auth_response.json.access_token }}"
+      when: auth_response.json.access_token is defined
+
+    - name: Fail if access token was not retrieved
+      ansible.builtin.fail:
+        msg: "Failed to retrieve access token from Delinea Secret Server."
+      when: access_token is not defined
+
+    - name: Get secret details by ID from Delinea Secret Server
+      ansible.builtin.uri:
+        url: "{{ delinea_server_url }}/api/v2/secrets/{{ delinea_secret_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ access_token }}"
+        status_code: 200
+        return_content: yes
+        validate_certs: yes
+      register: secret_data_response
+
+    - name: Display raw secret items (optional, for verification)
+      ansible.builtin.debug:
+        var: secret_data_response.json.items
+      when: secret_data_response.json.items is defined
+
+    - name: Ensure download directory exists on the controller
+      ansible.builtin.file:
+        path: "{{ download_output_directory }}"
+        state: directory
+        mode: "0755"
+      run_once: true
+
+    - name: Download specific files (File 2 and File 3) from Delinea
+      ansible.builtin.get_url:
+        url: "{{ delinea_server_url }}/api/v1/secrets/{{ delinea_secret_id }}/fields/{{ item.slug }}" # CORRECTED URL
+        headers:
+          Authorization: "Bearer {{ access_token }}"
+          # Optional: Add Accept header if you find it helps, though often not strictly needed
+          # Accept: "application/octet-stream"
+        dest: "{{ download_output_directory }}/{{ item.filename }}"
+        mode: "0640"
+        validate_certs: yes
+      loop: "{{ secret_data_response.json['items'] }}"
+      when:
+        - item.isFile | default(false)
+        - item.fileAttachmentId is not none # Good to keep as a sanity check that it's an actual attachment
+        - item.filename is not none and item.filename | length > 0
+        - item.slug in ['file-2', 'file-3'] # Target specific files by their slug
+      loop_control:
+        label: "Downloading {{ item.filename }} (slug: {{ item.slug }})"
+      no_log: "{{ no_log_parameter }}" # Set to true in production if paths/filenames are sensitive
+
+# This block should also run on localhost as the downloaded files are there.
+- name: Configure F5 BIG-IP SSL Components
+  connection: local
+  delegate_to: localhost
+  run_once: true # F5 configuration should typically happen once per playbook run for these objects
+  when: state == "present" # Add this back if 'state' is a variable controlling this operation
+  block:
+    - name: Ensure required F5 variables are defined
+      ansible.builtin.assert:
+        that:
+          - f5_hostname is defined and f5_hostname | length > 0
+          - f5_username is defined and f5_username | length > 0
+          - f5_password is defined and f5_password | length > 0
+          - f5_cert_and_key_name is defined and f5_cert_and_key_name | length > 0
+          - download_output_directory is defined and download_output_directory | length > 0
+          - secret_data_response.json['items'] is defined
+        fail_msg: >
+          One or more required F5 variables (f5_hostname, f5_username,
+          f5_password, f5_cert_and_key_name) or prerequisite Delinea variables
+          (download_output_directory, secret_data_response) are not properly defined.
+        quiet: yes
+
+    - name: Extract Delinea key and certificate item details for F5 upload
+      ansible.builtin.set_fact:
+        # Find the item for the key (assuming slug 'file-3' is the private key)
+        delinea_key_item_for_f5: "{{ secret_data_response.json['items'] | selectattr('slug', 'equalto', 'file-3') | first | default({}) }}"
+        # Find the item for the certificate (assuming slug 'file-2' is the certificate)
+        delinea_cert_item_for_f5: "{{ secret_data_response.json['items'] | selectattr('slug', 'equalto', 'file-2') | first | default({}) }}"
+
+    - name: Define full local paths for key and certificate to be uploaded to F5
+      ansible.builtin.set_fact:
+        local_key_file_path_for_f5: "{{ download_output_directory }}/{{ delinea_key_item_for_f5.filename }}"
+        local_cert_file_path_for_f5: "{{ download_output_directory }}/{{ delinea_cert_item_for_f5.filename }}"
+      when:
+        - delinea_key_item_for_f5.filename is defined
+        - delinea_cert_item_for_f5.filename is defined
+
+    - name: Fail if key or cert filenames were not found for F5 upload
+      ansible.builtin.fail:
+        msg: >
+          Could not determine filename for the key (expected slug: file-3)
+          or the certificate (expected slug: file-2) from the Delinea secret response.
+          Cannot proceed with F5 upload.
+      when: not (delinea_key_item_for_f5.filename and delinea_cert_item_for_f5.filename)
+
+    - name: Display F5 upload details (for debugging)
+      ansible.builtin.debug:
+        msg: |
+          Attempting to upload to F5: {{ f5_hostname }}
+          Key Object Name on F5: {{ f5_cert_and_key_name }}
+            Source Key File (from controller): {{ local_key_file_path_for_f5 }}
+          Cert Object Name on F5: {{ f5_cert_and_key_name }}
+            Source Cert File (from controller): {{ local_cert_file_path_for_f5 }}
+      when:
+        - local_key_file_path_for_f5 is defined
+        - local_cert_file_path_for_f5 is defined
+
+    - name: Upload SSL Private Key to F5
+      f5networks.f5_modules.bigip_ssl_key:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}" # Ensure this is your intended value
+        name: "{{ f5_cert_and_key_name }}" # Name of the key object on F5
+        content: "{{ lookup('file', local_key_file_path_for_f5) }}" # MODIFIED: Use content with lookup
+        state: "present"
+      no_log: "{{ no_log_parameter }}"
+      when: local_key_file_path_for_f5 is defined
+
+    - name: Upload SSL Certificate to F5
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}" # Ensure this is your intended value
+        name: "{{ f5_cert_and_key_name }}" # Name of the cert object on F5
+        content: "{{ lookup('file', local_cert_file_path_for_f5) }}" # MODIFIED: Use content with lookup
+        state: "present"
+      no_log: "{{ no_log_parameter }}"
+      when: local_cert_file_path_for_f5 is defined
+
+    - name: Create/Update Client SSL Profile on F5
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ f5_cert_and_key_name }}_clientssl"
+        cert_key_chain:
+          - cert: "/Common/{{ f5_cert_and_key_name }}" # F5 objects are often in /Common/ partition
+            key: "/Common/{{ f5_cert_and_key_name }}"
+        state: present
+      no_log: "{{ no_log_parameter }}"
+      when:
+        - local_key_file_path_for_f5 is defined
+        - local_cert_file_path_for_f5 is defined
+
+    - name: Create Nodes from determined backend nodes
+      f5networks.f5_modules.bigip_node:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port }}"
+          validate_certs: "{{ f5_validate_certs }}"
+        name:
+          "{{ item.key }}" # For nodes, the 'name' is often the same as the 'host' (IP/FQDN)
+          # Or you can have a different naming convention if desired.
+          # If 'name' should be different from 'host', you'll need to adjust.
+        host: "{{ item.value }}" # This uses the IP/hostname directly from the list
+        description: "{{ base_name }} node for {{ item }}"
+        state: "present"
+      loop: "{{ f5_nodes_list | dict2items }}"
+
+
+    - name: Ensure required variables for Pool and Virtual Servers are defined
+      ansible.builtin.assert:
+        that:
+          - pool_name is defined and pool_name | length > 0
+          - f5_backend_server_port is defined # and f5_backend_server_port is number
+          - virtual_server_ip is defined and virtual_server_ip | length > 0
+          - vs_http_name is defined and vs_http_name | length > 0
+          - f5_virtual_server_http_port is defined # and f5_virtual_server_http_port is number
+          - vs_https_name is defined and vs_https_name | length > 0
+          - f5_virtual_server_https_port is defined # and f5_virtual_server_https_port is number
+          - f5_cert_and_key_name is defined # Used for SSL profile name
+        fail_msg: >
+          One or more required F5 variables for Pool/VS configuration are not defined
+          (pool_name, f5_backend_server_port, virtual_server_ip,
+          vs_http_name, f5_virtual_server_http_port, vs_https_name, f5_virtual_server_https_port, f5_cert_and_key_name).
+        quiet: yes
+
+    - name: Create Load Balancing Pool '{{ pool_name }}'
+      f5networks.f5_modules.bigip_pool:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ pool_name }}"
+        partition: "Common" # Or your target partition
+        lb_method: "{{ f5_pool_lb_method | default('round-robin') }}"
+        monitors: "{{ f5_pool_monitors | default(omit) }}" # Omit if not defined
+        state: "present"
+      no_log: "{{ no_log_parameter }}"
+
+    - name: Add Members to Pool '{{ pool_name }}'
+      f5networks.f5_modules.bigip_pool_member:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        pool: "{{ pool_name }}"
+        partition: "Common" # Ensure partition matches the pool's partition
+        name: "{{ item.key }}" # This refers to the node object name (which is the IP address)
+        address: "{{ item.value }}" # ADD THIS BACK: Explicitly provide the IP address of the node
+        port: "{{ f5_backend_server_port }}"
+        state: "present"
+      loop: "{{ f5_nodes_list | dict2items }}"
+      no_log: "{{ no_log_parameter }}" # Consider setting to true in production
+
+    - name: Create HTTP Virtual Server '{{ vs_http_name }}'
+      f5networks.f5_modules.bigip_virtual_server:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ vs_http_name }}"
+        partition: "Common"
+        destination: "{{ virtual_server_ip }}"
+        port: "{{ f5_virtual_server_http_port }}"
+        pool: "{{ pool_name }}" # References the pool created above
+        snat: "{{ f5_snat_setting | default('automap') }}"
+        irules: "{{ f5_irule_name if application != 'ssrs' else omit }}" # http redirect is not needed for SSRS
+        profiles:
+          - name: "/Common/http-X"
+        # Default profiles like 'tcp' and 'http' are often applied automatically.
+        # Add explicitly if needed or if you use custom default profiles.
+        # profiles:
+        #   - name: /Common/tcp
+        #   - name: /Common/http
+        state: "present"
+      no_log: "{{ no_log_parameter }}"
+
+    - name: Create HTTPS Virtual Server '{{ vs_https_name }}'
+      f5networks.f5_modules.bigip_virtual_server:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ vs_https_name }}"
+        partition: "Common"
+        destination: "{{ virtual_server_ip }}" # Same VIP as HTTP VS
+        port: "{{ f5_virtual_server_https_port }}"
+        pool: "{{ pool_name }}" # Same backend pool
+        snat: "{{ f5_snat_setting | default('automap') }}"
+        profiles:
+          # Assumes client SSL profile name is {{ f5_cert_and_key_name }}_clientssl
+          # and it's in the Common partition.
+          - name: "/Common/{{ f5_cert_and_key_name }}_clientssl"
+            context: "clientside"
+          - name: "/Common/http" # Standard HTTP profile for L7 features
+          # - name: /Common/tcp # Often implied by http profile, but can be explicit
+        state: "present"
+      no_log: "{{ no_log_parameter }}"
+
+- name: Deconfigure F5 BIG-IP SSL Components
+  connection: local
+  delegate_to: localhost
+  run_once: true # Deconfiguration should also typically happen once
+  when: state == "absent" # Only run if state is 'absent'
+  block:
+    - name: Ensure required F5 variables for deconfiguration are defined
+      ansible.builtin.assert:
+        that:
+          - f5_hostname is defined and f5_hostname | length > 0
+          - f5_username is defined and f5_username | length > 0
+          - f5_password is defined and f5_password | length > 0
+          - f5_cert_and_key_name is defined # For cert, key, SSL profile
+          - pool_name is defined # For pool and its members
+          - vs_http_name is defined
+          - vs_https_name is defined
+          # f5_backend_server_port is not strictly needed for member deletion by name
+        fail_msg: >
+          One or more required F5 variables for deconfiguration are not defined.
+          Needed: f5_hostname, f5_username, f5_password, f5_cert_and_key_name,
+          pool_name, vs_http_name, vs_https_name.
+        quiet: yes
+
+    - name: Display F5 deconfiguration details (for debugging)
+      ansible.builtin.debug:
+        msg: |
+          Attempting to deconfigure F5 resources on: {{ f5_hostname }}
+          HTTPS Virtual Server: {{ vs_https_name }}
+          HTTP Virtual Server: {{ vs_http_name }}
+          Pool: {{ pool_name }}
+          Client SSL Profile: {{ f5_cert_and_key_name }}_clientssl
+          SSL Certificate: {{ f5_cert_and_key_name }}
+          SSL Key: {{ f5_cert_and_key_name }}
+
+    # 1. Delete Virtual Servers
+    - name: Delete HTTPS Virtual Server '{{ vs_https_name }}'
+      f5networks.f5_modules.bigip_virtual_server:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ vs_https_name }}"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    - name: Delete HTTP Virtual Server '{{ vs_http_name }}'
+      f5networks.f5_modules.bigip_virtual_server:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ vs_http_name }}"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    # 2. Delete Pool Members (before deleting the pool)
+    #    Note: Deleting the pool often automatically removes members,
+    #    but explicit deletion is safer and cleaner.
+    - name: Remove Members from Pool '{{ pool_name }}'
+      f5networks.f5_modules.bigip_pool_member:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        pool: "{{ pool_name }}"
+        partition: "Common" # Ensure partition matches the pool's partition
+        name: "{{ item.key }}" # This refers to the node object name (which is the IP address)
+        address: "{{ item.value }}" # ADD THIS BACK: Explicitly provide the IP address of the node
+        port: "{{ f5_backend_server_port }}"
+        state: "absent"
+      loop: "{{ f5_nodes_list | dict2items }}"
+      no_log: "{{ no_log_parameter }}" # Consider setting to true in production
+      ignore_errors: true # Ignore errors if members are already removed
+
+    # 3. Delete Load Balancing Pool
+    - name: Delete Load Balancing Pool '{{ pool_name }}'
+      f5networks.f5_modules.bigip_pool:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ pool_name }}"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    # 4. Delete Nodes
+    #    Only delete nodes if they are exclusively for this setup.
+    #    If nodes are shared, you might want to skip this or make it conditional.
+    - name: Delete Nodes
+      f5networks.f5_modules.bigip_node:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}" # Corrected from {{ f5_connection_port }} to include default
+          validate_certs: "{{ f5_validate_certs | default(true) }}" # Corrected from {{ f5_validate_certs }}
+        name: "{{ item.key }}" # Node name (IP address)
+        state: "absent"
+      loop: "{{ f5_nodes_list | dict2items }}"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    # 5. Delete Client SSL Profile
+    - name: Delete Client SSL Profile on F5
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ f5_cert_and_key_name }}_clientssl"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    # 6. Delete SSL Certificate
+    #    Ensure no other profiles are using this certificate.
+    - name: Delete SSL Certificate from F5
+      f5networks.f5_modules.bigip_ssl_certificate:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ f5_cert_and_key_name }}"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
+
+    # 7. Delete SSL Private Key
+    #    Ensure no other certificates are using this key.
+    - name: Delete SSL Private Key from F5
+      f5networks.f5_modules.bigip_ssl_key:
+        provider:
+          server: "{{ f5_hostname }}"
+          user: "{{ f5_username }}"
+          password: "{{ f5_password }}"
+          server_port: "{{ f5_connection_port | default(443) }}"
+          validate_certs: "{{ f5_validate_certs | default(true) }}"
+        name: "{{ f5_cert_and_key_name }}"
+        partition: "Common"
+        state: "absent"
+      no_log: "{{ no_log_parameter }}" # Consider true for production
