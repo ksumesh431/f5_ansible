@@ -12,7 +12,7 @@ Highlights
 - Notes on prerequisites, running playbooks, and troubleshooting
 
 Maintainer
-- ksumesh431 (they/them)
+- ksumesh431
 
 Prerequisites
 - Ansible (recommended ansible-core 2.12+)
